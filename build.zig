@@ -1,7 +1,6 @@
 const std = @import("std");
 
-const manifest_url =
-    "https://downloads.mongodb.com/app-services-cli/versions/cloud-prod/MANIFEST";
+const manifest_url = "https://downloads.mongodb.com/app-services-cli/versions/cloud-prod/MANIFEST";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -23,7 +22,6 @@ pub fn build(b: *std.Build) void {
     });
 
     b.installArtifact(exe);
-    // Sit next to the binary the way package.json sits next to install.js.
     b.installBinFile("package.toml", "package.toml");
 
     const run_cmd = b.addRunArtifact(exe);
@@ -32,7 +30,6 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Forward args to the downloaded appservices binary");
     run_step.dependOn(&run_cmd.step);
 
-    // npm scripts.install → node install.js
     const postinstall_cmd = b.addRunArtifact(exe);
     postinstall_cmd.addArg("--postinstall");
     postinstall_cmd.step.dependOn(b.getInstallStep());
@@ -40,7 +37,6 @@ pub fn build(b: *std.Build) void {
     const postinstall_step = b.step("postinstall", "Download and extract the appservices CLI");
     postinstall_step.dependOn(&postinstall_cmd.step);
 
-    // npm testInstall.js
     const test_install_cmd = b.addRunArtifact(exe);
     test_install_cmd.addArg("--test-install");
     test_install_cmd.step.dependOn(b.getInstallStep());

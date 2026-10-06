@@ -1,9 +1,3 @@
-//! Script 2 of 3: the install smoke test (testInstall.js).
-//!
-//! JS ran `npm i <package dir>` into `<tmpdir>/baas-cli-test` and asserted that
-//! `node_modules/atlas-app-services-cli/appservices[.exe]` exists.
-//! Here we run this binary's `--postinstall` into the same temp layout and
-//! assert that `appservices[.exe]` was extracted.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -11,7 +5,11 @@ const Io = std.Io;
 const console = @import("console.zig");
 
 fn kindOf(io: Io, path: []const u8) ?Io.File.Kind {
-    const st = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return null;
+    const st = Io.Dir.cwd().statFile(
+        io,
+        path,
+        .{ .follow_symlinks = false },
+    ) catch return null;
     return st.kind;
 }
 
@@ -52,25 +50,16 @@ fn checkSpawn(io: Io, result: std.process.RunResult) error{SpawnFailed}!void {
     }
 }
 
-fn copyFile(io: Io, gpa: Allocator, src: []const u8, dst: []const u8) !void {
-    const bytes = try Io.Dir.cwd().readFileAlloc(io, src, gpa, .limited(1 << 20));
-    defer gpa.free(bytes);
-    const f = try Io.Dir.cwd().createFile(io, dst, .{});
-    defer f.close(io);
-    var wbuf: [8 * 1024]u8 = undefined;
-    var w = f.writer(io, &wbuf);
-    try w.interface.writeAll(bytes);
-    try w.interface.flush();
+fn copyFile(io: Io, src: []const u8, dst: []const u8) !void {
+    const cwd = Io.Dir.cwd();
+    try cwd.copyFile(src, cwd, dst, io, .{});
 }
-
-const Allocator = std.mem.Allocator;
 
 pub fn run(init: std.process.Init) u8 {
     const io = init.io;
-    const gpa = init.gpa;
+    const strings = init.arena.allocator();
 
-    const temp_install_path = std.fs.path.join(gpa, &.{ tmpDir(init.environ_map), "baas-cli-test" }) catch return 1;
-    defer gpa.free(temp_install_path);
+    const temp_install_path = std.fs.path.join(strings, &.{ tmpDir(init.environ_map), "baas-cli-test" }) catch return 1;
 
     if (directoryExists(io, temp_install_path)) {
         console.log(io, "Deleting directory '{s}'.", .{temp_install_path});
@@ -94,14 +83,12 @@ pub fn run(init: std.process.Init) u8 {
 
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_len = std.process.executableDirPath(io, &dir_buf) catch return 1;
-    const package_toml_src = std.fs.path.join(gpa, &.{ dir_buf[0..dir_len], "package.toml" }) catch return 1;
-    defer gpa.free(package_toml_src);
-    const package_toml_dst = std.fs.path.join(gpa, &.{ temp_install_path, "package.toml" }) catch return 1;
-    defer gpa.free(package_toml_dst);
+    const package_toml_src = std.fs.path.join(strings, &.{ dir_buf[0..dir_len], "package.toml" }) catch return 1;
+    const package_toml_dst = std.fs.path.join(strings, &.{ temp_install_path, "package.toml" }) catch return 1;
 
-    copyFile(io, gpa, package_toml_src, package_toml_dst) catch |e| {
+    copyFile(io, package_toml_src, package_toml_dst) catch |e| {
         // Fall back to project-root package.toml when running from zig-cache before install.
-        copyFile(io, gpa, "package.toml", package_toml_dst) catch {
+        copyFile(io, "package.toml", package_toml_dst) catch {
             console.err(io, "Could not copy package.toml: {s}", .{@errorName(e)});
             return 1;
         };
@@ -111,6 +98,7 @@ pub fn run(init: std.process.Init) u8 {
         io.sleep(.fromMilliseconds(2000), .awake) catch return 1;
     }
 
+    const gpa = init.gpa;
     const res = std.process.run(gpa, io, .{
         .argv = &.{ self_path, "--postinstall" },
         .cwd = .{ .path = temp_install_path },
@@ -123,8 +111,7 @@ pub fn run(init: std.process.Init) u8 {
     checkSpawn(io, res) catch return 1;
 
     const exe_name = if (builtin.os.tag == .windows) "appservices.exe" else "appservices";
-    const executable = std.fs.path.join(gpa, &.{ temp_install_path, exe_name }) catch return 1;
-    defer gpa.free(executable);
+    const executable = std.fs.path.join(strings, &.{ temp_install_path, exe_name }) catch return 1;
 
     if (fileExists(io, executable)) {
         console.log(io, "Atlas App Services CLI installed fine.", .{});
