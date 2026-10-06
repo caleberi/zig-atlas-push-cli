@@ -59,7 +59,10 @@ pub fn run(init: std.process.Init) u8 {
     const io = init.io;
     const strings = init.arena.allocator();
 
-    const temp_install_path = std.fs.path.join(strings, &.{ tmpDir(init.environ_map), "baas-cli-test" }) catch return 1;
+    const temp_install_path = std.fs.path.join(strings, &.{
+        tmpDir(init.environ_map),
+        "appservices-cli-test",
+    }) catch return 1;
 
     if (directoryExists(io, temp_install_path)) {
         console.log(io, "Deleting directory '{s}'.", .{temp_install_path});
