@@ -27,40 +27,85 @@ const InstallError = error{
     Download,
 };
 
-var detail_buf: [1024]u8 = undefined;
-var detail: ?[]const u8 = null;
+/// Error set value plus an optional detail string (formatted into an inline buffer).
+fn Error(comptime T: type) type {
+    return struct {
+        @"error": T,
+        detail_buf: [1024]u8 = undefined,
+        detail: ?[]const u8 = null,
 
-fn setDetail(comptime fmt: []const u8, args: anytype) void {
-    detail = std.fmt.bufPrint(&detail_buf, fmt, args) catch null;
-}
+        const Self = @This();
 
-fn describe(e: anyerror) []const u8 {
-    return switch (e) {
-        error.OnlyLinux64 => "Only Linux 64 bits supported.",
-        error.OnlyMac64 => "Only Mac 64 bits supported.",
-        error.OnlyWindows64 => "Only Windows 64 bits supported.",
-        error.UnexpectedPlatform => "Unexpected platform or architecture.",
-        error.UnexpectedArchive, error.Download, error.HttpStatus => detail orelse @errorName(e),
-        else => @errorName(e),
+        pub fn init(err: T) Self {
+            return .{ .@"error" = err };
+        }
+
+        pub fn initFmt(err: T, comptime fmt: []const u8, args: anytype) Self {
+            var self: Self = .{ .@"error" = err };
+            self.detail = std.fmt.bufPrint(&self.detail_buf, fmt, args) catch null;
+            return self;
+        }
+
+        pub fn describe(self: *const Self) []const u8 {
+            return switch (self.@"error") {
+                error.OnlyLinux64 => "Only Linux 64 bits supported.",
+                error.OnlyMac64 => "Only Mac 64 bits supported.",
+                error.OnlyWindows64 => "Only Windows 64 bits supported.",
+                error.UnexpectedPlatform => "Unexpected platform or architecture.",
+                error.UnexpectedArchive, error.Download, error.HttpStatus => self.detail orelse @errorName(self.@"error"),
+                else => @errorName(self.@"error"),
+            };
+        }
     };
 }
 
-fn fetchManifest(gpa: Allocator, io: Io) ![]u8 {
+const Fail = Error(InstallError);
+
+fn Result(comptime T: type) type {
+    return union(enum) {
+        ok: T,
+        err: Fail,
+    };
+}
+
+fn coerceInstall(e: anyerror) Fail {
+    return switch (e) {
+        error.OnlyLinux64 => Fail.init(error.OnlyLinux64),
+        error.OnlyMac64 => Fail.init(error.OnlyMac64),
+        error.OnlyWindows64 => Fail.init(error.OnlyWindows64),
+        error.UnexpectedPlatform => Fail.init(error.UnexpectedPlatform),
+        error.ManifestMalformed => Fail.init(error.ManifestMalformed),
+        error.PackageTomlMalformed => Fail.init(error.PackageTomlMalformed),
+        error.HttpStatus => Fail.init(error.HttpStatus),
+        error.UnexpectedArchive => Fail.init(error.UnexpectedArchive),
+        error.Download => Fail.init(error.Download),
+        else => Fail.initFmt(error.Download, "{s}", .{@errorName(e)}),
+    };
+}
+
+fn fetchManifest(gpa: Allocator, io: Io) Result([]u8) {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     var body: Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
 
-    const res = try client.fetch(.{
+    const res = client.fetch(.{
         .location = .{ .url = manifest_url },
         .response_writer = &body.writer,
-    });
+    }) catch |e| return .{ .err = coerceInstall(e) };
+
     if (res.status.class() != .success) {
-        setDetail("Request failed with status code {d}", .{@intFromEnum(res.status)});
-        return error.HttpStatus;
+        return .{ .err = Fail.initFmt(
+            error.HttpStatus,
+            "Request failed with status code {d}",
+            .{@intFromEnum(res.status)},
+        ) };
     }
-    return body.toOwnedSlice();
+    const slice = body.toOwnedSlice() catch |e| return .{
+        .err = coerceInstall(e),
+    };
+    return .{ .ok = slice };
 }
 
 fn platformTag() InstallError![]const u8 {
@@ -71,7 +116,6 @@ fn platformTag() InstallError![]const u8 {
             .aarch64 => "linux-arm64",
             else => error.OnlyLinux64,
         },
-        // The JS maps both 'darwin' and 'freebsd' to the darwin builds; kept as-is.
         .macos, .freebsd => switch (arch) {
             .x86_64 => "darwin-amd64",
             .aarch64 => "darwin-arm64",
@@ -87,7 +131,7 @@ fn objectField(v: std.json.Value, key: []const u8) ?std.json.Value {
     return v.object.get(key);
 }
 
-fn urlFor(info: ?std.json.Value, tag: []const u8) ![]const u8 {
+fn urlFor(info: ?std.json.Value, tag: []const u8) InstallError![]const u8 {
     const entry = objectField(info orelse return error.ManifestMalformed, tag) orelse return error.ManifestMalformed;
     const url = objectField(entry, "url") orelse return error.ManifestMalformed;
     if (url != .string) return error.ManifestMalformed;
@@ -118,38 +162,47 @@ fn readPackageToml(gpa: Allocator, io: Io) ![]u8 {
     if (std.process.executableDirPath(io, &dir_buf)) |dir_len| {
         const beside = try std.fs.path.join(gpa, &.{ dir_buf[0..dir_len], "package.toml" });
         defer gpa.free(beside);
-        if (Io.Dir.cwd().readFileAlloc(io, beside, gpa, .limited(1 << 20))) |bytes| return bytes else |_| {}
+        if (Io.Dir.cwd().readFileAlloc(
+            io,
+            beside,
+            gpa,
+            .limited(1 << 20),
+        )) |bytes| return bytes else |_| {}
     } else |_| {}
     return Io.Dir.cwd().readFileAlloc(io, "package.toml", gpa, .limited(1 << 20));
 }
 
-fn getDownloadURL(gpa: Allocator, io: Io, manifest_json: []const u8) ![]u8 {
-    const tag = try platformTag();
+fn getDownloadURL(gpa: Allocator, io: Io, manifest_json: []const u8) Result([]u8) {
+    const tag = platformTag() catch |e| return .{ .err = Fail.init(e) };
 
-    var manifest = try std.json.parseFromSlice(std.json.Value, gpa, manifest_json, .{});
+    var manifest = std.json.parseFromSlice(std.json.Value, gpa, manifest_json, .{}) catch |e| return .{ .err = coerceInstall(e) };
     defer manifest.deinit();
 
     // if (manifest.version !== packageMetadata.version) { look in past_releases }
     // this was selected for package.json which we will turn into a toml file for this
     // purpose.
-    const pkg_bytes = try readPackageToml(gpa, io);
+    const pkg_bytes = readPackageToml(gpa, io) catch |e| return .{ .err = coerceInstall(e) };
     defer gpa.free(pkg_bytes);
-    const pkg_version = try tomlStringField(pkg_bytes, "version");
+    const pkg_version = tomlStringField(pkg_bytes, "version") catch |e| return .{ .err = Fail.init(e) };
 
-    const manifest_version = objectField(manifest.value, "version") orelse return error.ManifestMalformed;
-    if (manifest_version != .string) return error.ManifestMalformed;
+    const manifest_version = objectField(manifest.value, "version") orelse return .{ .err = Fail.init(error.ManifestMalformed) };
+    if (manifest_version != .string) return .{ .err = Fail.init(error.ManifestMalformed) };
 
     if (!std.mem.eql(u8, manifest_version.string, pkg_version)) {
         if (objectField(manifest.value, "past_releases")) |past| {
             if (past == .array) for (past.array.items) |release| {
                 const v = objectField(release, "version") orelse continue;
                 if (v == .string and std.mem.eql(u8, v.string, pkg_version)) {
-                    return gpa.dupe(u8, try urlFor(objectField(release, "info"), tag));
+                    const u = urlFor(objectField(release, "info"), tag) catch |e| return .{ .err = Fail.init(e) };
+                    const duped = gpa.dupe(u8, u) catch |e| return .{ .err = coerceInstall(e) };
+                    return .{ .ok = duped };
                 }
             };
         }
     }
-    return gpa.dupe(u8, try urlFor(objectField(manifest.value, "info"), tag));
+    const u = urlFor(objectField(manifest.value, "info"), tag) catch |e| return .{ .err = Fail.init(e) };
+    const duped = gpa.dupe(u8, u) catch |e| return .{ .err = coerceInstall(e) };
+    return .{ .ok = duped };
 }
 
 const Chunk = struct {
@@ -161,15 +214,16 @@ const Shared = struct {
     gpa: Allocator,
     url: []const u8,
     ch: prim.Channel(Chunk),
-    failed: ?anyerror = null,
+    failed: ?Fail = null,
 };
 
 fn produce(io: Io, s: *Shared) Io.Cancelable!void {
     produceInner(io, s) catch |e| switch (e) {
         error.Canceled => return error.Canceled,
         else => {
-            setDetail("Error with http(s) request: {s}", .{@errorName(e)});
-            s.failed = error.Download;
+            if (s.failed == null) {
+                s.failed = Fail.initFmt(error.Download, "Error with http(s) request: {s}", .{@errorName(e)});
+            }
         },
     };
     s.ch.close(io) catch return error.Canceled;
@@ -190,8 +244,7 @@ fn produceInner(io: Io, s: *Shared) !void {
     var redirect_buf: [8 * 1024]u8 = undefined;
     var response = try req.receiveHead(&redirect_buf);
     if (response.head.status.class() != .success) {
-        setDetail("Request failed with status code {d}", .{@intFromEnum(response.head.status)});
-        s.failed = error.HttpStatus;
+        s.failed = Fail.initFmt(error.HttpStatus, "Request failed with status code {d}", .{@intFromEnum(response.head.status)});
         return;
     }
 
@@ -212,8 +265,9 @@ fn consume(io: Io, s: *Shared, file: Io.File) Io.Cancelable!void {
     consumeInner(io, s, file) catch |e| switch (e) {
         error.Canceled => return error.Canceled,
         else => {
-            setDetail("Error writing archive: {s}", .{@errorName(e)});
-            s.failed = error.Download;
+            if (s.failed == null) {
+                s.failed = Fail.initFmt(error.Download, "Error writing archive: {s}", .{@errorName(e)});
+            }
             s.ch.close(io) catch return error.Canceled;
         },
     };
@@ -250,14 +304,15 @@ fn fixFilePermissions(io: Io, file: Io.File) !void {
     }
 }
 
-fn requestArchive(gpa: Allocator, io: Io, download_url: []const u8) ![]u8 {
+fn requestArchive(gpa: Allocator, io: Io, download_url: []const u8) Result([]u8) {
     console.log(io, "downloading appservices cli archive from \"{s}\"", .{download_url});
 
     const slash = std.mem.lastIndexOfScalar(u8, download_url, '/');
-    const archive_name = try gpa.dupe(u8, if (slash) |i| download_url[i + 1 ..] else download_url);
-    errdefer gpa.free(archive_name);
+    const archive_name = gpa.dupe(u8, if (slash) |i| download_url[i + 1 ..] else download_url) catch |e| return .{ .err = coerceInstall(e) };
+    var owned = true;
+    defer if (owned) gpa.free(archive_name);
 
-    const buffer = try gpa.alloc(Chunk, 8);
+    const buffer = gpa.alloc(Chunk, 8) catch |e| return .{ .err = coerceInstall(e) };
     defer gpa.free(buffer);
 
     var shared: Shared = .{
@@ -266,18 +321,21 @@ fn requestArchive(gpa: Allocator, io: Io, download_url: []const u8) ![]u8 {
         .ch = prim.Channel(Chunk).initBuffered(buffer),
     };
 
-    const out_file = try Io.Dir.cwd().createFile(io, archive_name, .{});
+    const out_file = Io.Dir.cwd().createFile(io, archive_name, .{}) catch |e| return .{ .err = coerceInstall(e) };
     defer out_file.close(io);
 
     var wg = prim.WaitGroup.init(io);
-    errdefer wg.cancel();
-    try wg.zig(produce, .{ io, &shared });
-    try wg.zig(consume, .{ io, &shared, out_file });
-    try wg.join();
+    var joined = false;
+    defer if (!joined) wg.cancel();
+    wg.zig(produce, .{ io, &shared }) catch |e| return .{ .err = coerceInstall(e) };
+    wg.zig(consume, .{ io, &shared, out_file }) catch |e| return .{ .err = coerceInstall(e) };
+    wg.join() catch |e| return .{ .err = coerceInstall(e) };
+    joined = true;
 
-    if (shared.failed) |e| return e;
-    try fixFilePermissions(io, out_file);
-    return archive_name;
+    if (shared.failed) |f| return .{ .err = f };
+    fixFilePermissions(io, out_file) catch |e| return .{ .err = coerceInstall(e) };
+    owned = false;
+    return .{ .ok = archive_name };
 }
 
 fn untar(io: Io, path: []const u8) !void {
@@ -346,34 +404,45 @@ fn unzip(gpa: Allocator, io: Io, path: []const u8) !void {
     }
 }
 
-fn decompressArchive(gpa: Allocator, io: Io, filepath: []const u8) !void {
-    if (std.mem.endsWith(u8, filepath, "zip")) return unzip(gpa, io, filepath);
-    if (std.mem.endsWith(u8, filepath, "tar.gz")) return untar(io, filepath);
-    setDetail("could not decompress archive: unexpected archive type for file: {s}", .{filepath});
-    return error.UnexpectedArchive;
+fn decompressArchive(gpa: Allocator, io: Io, filepath: []const u8) ?Fail {
+    if (std.mem.endsWith(u8, filepath, "zip")) {
+        unzip(gpa, io, filepath) catch |e| return coerceInstall(e);
+        return null;
+    }
+    if (std.mem.endsWith(u8, filepath, "tar.gz")) {
+        untar(io, filepath) catch |e| return coerceInstall(e);
+        return null;
+    }
+    return Fail.initFmt(error.UnexpectedArchive, "could not decompress archive: unexpected archive type for file: {s}", .{filepath});
 }
 
-fn execute(gpa: Allocator, io: Io) !void {
-    const manifest = try fetchManifest(gpa, io);
+/// Runs the install pipeline. Returns a populated `Fail` on error, `null` on success.
+fn execute(gpa: Allocator, io: Io) ?Fail {
+    const manifest = switch (fetchManifest(gpa, io)) {
+        .ok => |m| m,
+        .err => |f| return f,
+    };
     defer gpa.free(manifest);
 
-    const url = try getDownloadURL(gpa, io, manifest);
+    const url = switch (getDownloadURL(gpa, io, manifest)) {
+        .ok => |u| u,
+        .err => |f| return f,
+    };
     defer gpa.free(url);
 
-    const archive = try requestArchive(gpa, io, url);
+    const archive = switch (requestArchive(gpa, io, url)) {
+        .ok => |a| a,
+        .err => |f| return f,
+    };
     defer gpa.free(archive);
 
-    try decompressArchive(gpa, io, archive);
+    return decompressArchive(gpa, io, archive);
 }
 
 pub fn run(init: std.process.Init) u8 {
-    execute(init.gpa, init.io) catch |e| {
-        console.err(io_of(init), "failed to download Atlas App Services CLI: {s}", .{describe(e)});
+    if (execute(init.gpa, init.io)) |f| {
+        console.err(init.io, "failed to download Atlas App Services CLI: {s}", .{f.describe()});
         return 1;
-    };
+    }
     return 0;
-}
-
-inline fn io_of(init: std.process.Init) Io {
-    return init.io;
 }
