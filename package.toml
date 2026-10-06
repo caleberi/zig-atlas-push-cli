@@ -1,0 +1,6 @@
+# Zig stand-in for the npm package.json metadata that install.js reads
+# to pick the matching appservices archive from the MANIFEST.
+name = "atlas-app-services-cli"
+version = "2.1.5"
+description = "The Atlas App Services Command Line Interface"
+license = "Apache-2.0"

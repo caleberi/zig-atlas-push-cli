@@ -1,0 +1,12 @@
+zig-out/
+zig-cache/
+*.core
+.zig-cache/
+zig-pkg/
+vendor/zap/
+.env
+*.bin
+*.dat
+manifest*.json
+*.json
+.DS_Store
