@@ -2,12 +2,29 @@ const std = @import("std");
 
 const manifest_url = "https://downloads.mongodb.com/app-services-cli/versions/cloud-prod/MANIFEST";
 
+fn packageVersion(b: *std.Build) []const u8 {
+    const contents = @embedFile("package.toml");
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, "version")) continue;
+        var rest = std.mem.trim(u8, line["version".len..], " \t");
+        if (rest.len == 0 or rest[0] != '=') continue;
+        rest = std.mem.trim(u8, rest[1..], " \t");
+        if (rest.len < 2 or rest[0] != '"') continue;
+        const end = std.mem.indexOfScalar(u8, rest[1..], '"') orelse continue;
+        return b.dupe(rest[1 .. 1 + end]);
+    }
+    @panic("package.toml missing version");
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
 
     const config = b.addOptions();
     config.addOption([]const u8, "manifest_url", manifest_url);
+    config.addOption([]const u8, "package_version", packageVersion(b));
 
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
