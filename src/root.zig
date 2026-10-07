@@ -11,11 +11,9 @@ pub const launch = @import("launch.zig");
 pub const install = @import("install.zig");
 pub const verify = @import("verify.zig");
 pub const console = @import("console.zig");
-pub const primitives = @import("primitives/root.zig");
 
 test {
     _ = launch;
     _ = install;
     _ = verify;
-    _ = primitives;
 }

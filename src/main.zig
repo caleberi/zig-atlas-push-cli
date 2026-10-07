@@ -8,7 +8,6 @@
 //!
 //! Everything that is not one of the two reserved flags is forwarded untouched
 //! to the real `appservices` binary, exactly like wrapper.js forwards argv.
-//! Concurrency comes from the primitive library in `primitives/`.
 const std = @import("std");
 const launch = @import("launch.zig");
 const install = @import("install.zig");
@@ -24,6 +23,5 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 test {
-    _ = @import("primitives/root.zig");
     _ = @import("root.zig");
 }

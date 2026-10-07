@@ -1,18 +1,16 @@
 //! JS flow: fetchManifest -> getDownloadURL -> requestArchive -> decompressArchive.
-//! The download is the only stage that was stream-driven in JS (`stream.on('data')`),
-//! so it is built from the primitives: a producer routine reads the HTTP body into
-//! a buffered `Channel`, a consumer routine writes chunks to disk and reports
-//! progress, and a `WaitGroup` joins them.
+//! Download streams the HTTP body straight into the archive file.
+//! Zip extracts into cwd and hoists a common root directory when present.
 const std = @import("std");
 const builtin = @import("builtin");
-const prim = @import("primitives/root.zig");
 const console = @import("console.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const KILOBYTE = 1024;
-const MAX_BYTES_READ = 800000;
+const PROGRESS_BYTES = 2 * 800000; // ~1.6MB between progress updates
 const manifest_url = @import("config").manifest_url;
+const package_version = @import("config").package_version;
 
 const InstallError = error{
     OnlyLinux64,
@@ -20,7 +18,6 @@ const InstallError = error{
     OnlyWindows64,
     UnexpectedPlatform,
     ManifestMalformed,
-    PackageTomlMalformed,
     HttpStatus,
     UnexpectedArchive,
     Download,
@@ -73,12 +70,41 @@ fn coerceInstall(e: anyerror) Fail {
         error.OnlyWindows64 => Fail.init(error.OnlyWindows64),
         error.UnexpectedPlatform => Fail.init(error.UnexpectedPlatform),
         error.ManifestMalformed => Fail.init(error.ManifestMalformed),
-        error.PackageTomlMalformed => Fail.init(error.PackageTomlMalformed),
         error.HttpStatus => Fail.init(error.HttpStatus),
         error.UnexpectedArchive => Fail.init(error.UnexpectedArchive),
         error.Download => Fail.init(error.Download),
         else => Fail.initFmt(error.Download, "{s}", .{@errorName(e)}),
     };
+}
+
+fn appservicesName() []const u8 {
+    return if (builtin.os.tag == .windows) "appservices.exe" else "appservices";
+}
+
+/// Skip download when cwd already has a matching appservices binary.
+fn alreadyCurrent(gpa: Allocator, io: Io) bool {
+    const exe = appservicesName();
+    _ = Io.Dir.cwd().statFile(io, exe, .{}) catch return false;
+
+    // argv[0] must contain a path separator or spawn resolves via PATH (not cwd).
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = std.process.currentPath(io, &dir_buf) catch return false;
+    const binary_path = std.fs.path.join(gpa, &.{ dir_buf[0..dir_len], exe }) catch return false;
+    defer gpa.free(binary_path);
+
+    const res = std.process.run(gpa, io, .{
+        .argv = &.{ binary_path, "--version" },
+    }) catch return false;
+    defer gpa.free(res.stdout);
+    defer gpa.free(res.stderr);
+
+    const ok = switch (res.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) return false;
+    return std.mem.indexOf(u8, res.stdout, package_version) != null or
+        std.mem.indexOf(u8, res.stderr, package_version) != null;
 }
 
 fn fetchManifest(allocator: Allocator, io: Io) Result([]u8) {
@@ -100,9 +126,7 @@ fn fetchManifest(allocator: Allocator, io: Io) Result([]u8) {
             .{@intFromEnum(res.status)},
         ) };
     }
-    const slice = body.toOwnedSlice() catch |e| return .{
-        .err = coerceInstall(e),
-    };
+    const slice = body.toOwnedSlice() catch |e| return .{ .err = coerceInstall(e) };
     return .{ .ok = slice };
 }
 
@@ -129,182 +153,49 @@ fn objectField(v: std.json.Value, key: []const u8) ?std.json.Value {
     return v.object.get(key);
 }
 
-fn urlFor(info: ?std.json.Value, tag: []const u8) InstallError![]const u8 {
-    const v = info orelse return error.ManifestMalformed;
-    const entry = objectField(v, tag) orelse return error.ManifestMalformed;
+fn urlFor(info: std.json.Value, tag: []const u8) InstallError![]const u8 {
+    const entry = objectField(info, tag) orelse return error.ManifestMalformed;
     const url = objectField(entry, "url") orelse return error.ManifestMalformed;
     if (url != .string) return error.ManifestMalformed;
     return url.string;
 }
 
-/// Minimal TOML string-field reader for `package.toml` (version = "x.y.z").
-fn tomlStringField(bytes: []const u8, key: []const u8) InstallError![]const u8 {
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0 or line[0] == '#') continue;
-        if (!std.mem.startsWith(u8, line, key)) continue;
-        var rest = std.mem.trim(u8, line[key.len..], " \t");
-        if (rest.len == 0 or rest[0] != '=') continue;
-        rest = std.mem.trim(u8, rest[1..], " \t");
-        if (rest.len < 2 or rest[0] != '"') return error.PackageTomlMalformed;
-        const end = std.mem.indexOfScalar(u8, rest[1..], '"') orelse return error.PackageTomlMalformed;
-        return rest[1 .. 1 + end];
-    }
-    return error.PackageTomlMalformed;
-}
+const ManifestFile = struct {
+    version: []const u8,
+    info: std.json.Value,
+    past_releases: []const PastRelease = &.{},
+};
 
-/// Prefer package.toml next to this binary (npm keeps package.json next to install.js);
-/// fall back to cwd for `zig build postinstall` from the project root before install.
-fn readPackageToml(allocator: Allocator, io: Io) ![]u8 {
-    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    if (std.process.executableDirPath(io, &dir_buf)) |dir_len| {
-        const toml_path = try std.fs.path.join(allocator, &.{ dir_buf[0..dir_len], "package.toml" });
-        defer allocator.free(toml_path);
-        if (Io.Dir.cwd().readFileAlloc(
-            io,
-            toml_path,
-            allocator,
-            .limited(1 << 20),
-        )) |bytes| return bytes else |_| {}
-    } else |_| {}
-    return Io.Dir.cwd().readFileAlloc(io, "package.toml", allocator, .limited(1 << 20));
-}
+const PastRelease = struct {
+    version: []const u8,
+    info: std.json.Value,
+};
 
-fn getDownloadURL(allocator: Allocator, io: Io, manifest_json: []const u8) Result([]u8) {
+fn getDownloadURL(allocator: Allocator, manifest_json: []const u8) Result([]u8) {
     const tag = platformTag() catch |e| return .{ .err = Fail.init(e) };
 
-    var manifest = std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        manifest_json,
-        .{},
-    ) catch |e| return .{ .err = coerceInstall(e) };
-    defer manifest.deinit();
+    var parsed = std.json.parseFromSlice(ManifestFile, allocator, manifest_json, .{
+        .ignore_unknown_fields = true,
+    }) catch |e| return .{ .err = coerceInstall(e) };
+    defer parsed.deinit();
 
-    const pkg_bytes = readPackageToml(allocator, io) catch |e| return .{ .err = coerceInstall(e) };
-    defer allocator.free(pkg_bytes);
-
-    const pkg_version = tomlStringField(pkg_bytes, "version") catch |e| return .{ .err = Fail.init(e) };
-    const manifest_version = objectField(manifest.value, "version") orelse return .{ .err = Fail.init(error.ManifestMalformed) };
-    if (manifest_version != .string) return .{ .err = Fail.init(error.ManifestMalformed) };
-
-    if (!std.mem.eql(u8, manifest_version.string, pkg_version)) {
-        if (objectField(manifest.value, "past_releases")) |past| {
-            if (past == .array) for (past.array.items) |release| {
-                const v = objectField(release, "version") orelse continue;
-                if (v == .string and std.mem.eql(u8, v.string, pkg_version)) {
-                    const u = urlFor(objectField(release, "info"), tag) catch |e| return .{ .err = Fail.init(e) };
-                    const duped = allocator.dupe(u8, u) catch |e| return .{ .err = coerceInstall(e) };
-                    return .{ .ok = duped };
-                }
-            };
+    const manifest = parsed.value;
+    if (!std.mem.eql(u8, manifest.version, package_version)) {
+        for (manifest.past_releases) |release| {
+            if (std.mem.eql(u8, release.version, package_version)) {
+                const u = urlFor(release.info, tag) catch |e| return .{ .err = Fail.init(e) };
+                const duped = allocator.dupe(u8, u) catch |e| return .{ .err = coerceInstall(e) };
+                return .{ .ok = duped };
+            }
         }
     }
-    const u = urlFor(objectField(manifest.value, "info"), tag) catch |e| return .{ .err = Fail.init(e) };
+    const u = urlFor(manifest.info, tag) catch |e| return .{ .err = Fail.init(e) };
     const duped = allocator.dupe(u8, u) catch |e| return .{ .err = coerceInstall(e) };
     return .{ .ok = duped };
 }
 
-const Chunk = struct {
-    len: usize,
-    data: [16 * 1024]u8,
-};
-
-const Shared = struct {
-    gpa: Allocator,
-    url: []const u8,
-    // using this is just solving for a non-existing problem
-    // using a direct download is actually more efficient
-    ch: prim.Channel(Chunk),
-    failed: ?Fail = null,
-};
-
-fn produce(io: Io, s: *Shared) Io.Cancelable!void {
-    produceInner(io, s) catch |e| switch (e) {
-        error.Canceled => return error.Canceled,
-        else => {
-            if (s.failed == null) {
-                s.failed = Fail.initFmt(error.Download, "Error with http(s) request: {s}", .{@errorName(e)});
-            }
-        },
-    };
-    s.ch.close(io) catch return error.Canceled;
-}
-
-fn produceInner(io: Io, s: *Shared) !void {
-    var client: std.http.Client = .{ .allocator = s.gpa, .io = io };
-    defer client.deinit();
-
-    const uri = try std.Uri.parse(s.url);
-    var req = try client.request(.GET, uri, .{
-        // We want the archive bytes untouched.
-        .headers = .{ .accept_encoding = .{ .override = "identity" } },
-    });
-    defer req.deinit();
-    try req.sendBodiless();
-
-    var redirect_buf: [8 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-    if (response.head.status.class() != .success) {
-        s.failed = Fail.initFmt(error.HttpStatus, "Request failed with status code {d}", .{@intFromEnum(response.head.status)});
-        return;
-    }
-
-    var transfer_buf: [4 * 1024]u8 = undefined;
-    const body = response.reader(&transfer_buf);
-    while (true) {
-        var chunk: Chunk = .{ .len = 0, .data = undefined };
-        chunk.len = body.readSliceShort(&chunk.data) catch |e| return response.bodyErr() orelse e;
-        if (chunk.len == 0) return;
-        s.ch.send(io, chunk) catch |e| switch (e) {
-            error.Closed => return,
-            error.Canceled => return error.Canceled,
-        };
-    }
-}
-
-fn consume(io: Io, s: *Shared, file: Io.File) Io.Cancelable!void {
-    consumeInner(io, s, file) catch |e| switch (e) {
-        error.Canceled => return error.Canceled,
-        else => {
-            if (s.failed == null) {
-                s.failed = Fail.initFmt(error.Download, "Error writing archive: {s}", .{@errorName(e)});
-            }
-            s.ch.close(io) catch return error.Canceled;
-        },
-    };
-}
-
-fn consumeInner(io: Io, s: *Shared, file: Io.File) !void {
-    var wbuf: [64 * 1024]u8 = undefined;
-    var fw = file.writer(io, &wbuf);
-
-    var count: u64 = 0;
-    var notified_count: u64 = 0;
-    while (true) {
-        const chunk = s.ch.receive(io) catch |e| switch (e) {
-            error.Closed => break,
-            error.Canceled => return error.Canceled,
-        };
-        try fw.interface.writeAll(chunk.data[0..chunk.len]);
-        count += chunk.len;
-        if (count - notified_count > MAX_BYTES_READ) {
-            console.write(io, "Received {d} K...\r", .{count / KILOBYTE});
-            notified_count = count;
-        }
-    }
-    try fw.interface.flush();
-    if (s.failed == null) console.log(io, "Received {d} K total.", .{count / KILOBYTE});
-}
-
-fn fixFilePermissions(io: Io, file: Io.File) !void {
-    if (comptime builtin.os.tag != .windows and Io.File.Permissions.has_executable_bit) {
-        const st = try file.stat(io);
-        if (st.permissions.toMode() & 0o100 == 0) {
-            try file.setPermissions(io, .fromMode(0o755));
-        }
-    }
+fn progressEnabled(io: Io) bool {
+    return Io.File.stdout().isTty(io) catch false;
 }
 
 fn requestArchive(gpa: Allocator, io: Io, download_url: []const u8) Result([]u8) {
@@ -315,28 +206,48 @@ fn requestArchive(gpa: Allocator, io: Io, download_url: []const u8) Result([]u8)
     var owned = true;
     defer if (owned) gpa.free(archive_name);
 
-    const buffer = gpa.alloc(Chunk, 8) catch |e| return .{ .err = coerceInstall(e) };
-    defer gpa.free(buffer);
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
 
-    var shared: Shared = .{
-        .gpa = gpa,
-        .url = download_url,
-        .ch = prim.Channel(Chunk).initBuffered(buffer),
-    };
+    const uri = std.Uri.parse(download_url) catch |e| return .{ .err = coerceInstall(e) };
+    var req = client.request(.GET, uri, .{
+        .headers = .{ .accept_encoding = .{ .override = "identity" } },
+    }) catch |e| return .{ .err = Fail.initFmt(error.Download, "Error with http(s) request: {s}", .{@errorName(e)}) };
+    defer req.deinit();
+    req.sendBodiless() catch |e| return .{ .err = Fail.initFmt(error.Download, "Error with http(s) request: {s}", .{@errorName(e)}) };
+
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var response = req.receiveHead(&redirect_buf) catch |e| return .{ .err = Fail.initFmt(error.Download, "Error with http(s) request: {s}", .{@errorName(e)}) };
+    if (response.head.status.class() != .success) {
+        return .{ .err = Fail.initFmt(error.HttpStatus, "Request failed with status code {d}", .{@intFromEnum(response.head.status)}) };
+    }
 
     const out_file = Io.Dir.cwd().createFile(io, archive_name, .{}) catch |e| return .{ .err = coerceInstall(e) };
     defer out_file.close(io);
 
-    var wg = prim.WaitGroup.init(io);
-    var joined = false;
-    defer if (!joined) wg.cancel();
-    wg.zig(produce, .{ io, &shared }) catch |e| return .{ .err = coerceInstall(e) };
-    wg.zig(consume, .{ io, &shared, out_file }) catch |e| return .{ .err = coerceInstall(e) };
-    wg.join() catch |e| return .{ .err = coerceInstall(e) };
-    joined = true;
+    var rbuf: [64 * 1024]u8 = undefined;
+    var wbuf: [64 * 1024]u8 = undefined;
+    var fw = out_file.writer(io, &wbuf);
+    const body = response.reader(&rbuf);
+    const show_progress = progressEnabled(io);
 
-    if (shared.failed) |f| return .{ .err = f };
-    fixFilePermissions(io, out_file) catch |e| return .{ .err = coerceInstall(e) };
+    var count: u64 = 0;
+    var notified_count: u64 = 0;
+    while (true) {
+        const n = body.stream(&fw.interface, .limited(PROGRESS_BYTES)) catch |e| switch (e) {
+            error.EndOfStream => break,
+            error.ReadFailed => return .{ .err = Fail.initFmt(error.Download, "Error with http(s) request: {s}", .{@errorName(response.bodyErr() orelse e)}) },
+            error.WriteFailed => return .{ .err = Fail.initFmt(error.Download, "Error writing archive: {s}", .{@errorName(e)}) },
+        };
+        count += n;
+        if (show_progress and count - notified_count >= PROGRESS_BYTES) {
+            console.write(io, "Received {d} K...\r", .{count / KILOBYTE});
+            notified_count = count;
+        }
+    }
+    fw.interface.flush() catch |e| return .{ .err = Fail.initFmt(error.Download, "Error writing archive: {s}", .{@errorName(e)}) };
+    console.log(io, "Received {d} K total.", .{count / KILOBYTE});
+
     owned = false;
     return .{ .ok = archive_name };
 }
@@ -354,39 +265,35 @@ fn untar(io: Io, path: []const u8) !void {
     try std.tar.extract(io, cwd, &gz.reader, .{ .strip_components = 1 });
 }
 
-const stage_dir = ".appservices-extract";
+fn chmodAppservices(io: Io) void {
+    if (comptime builtin.os.tag != .windows and Io.File.Permissions.has_executable_bit) {
+        if (Io.Dir.cwd().openFile(io, appservicesName(), .{})) |bin| {
+            defer bin.close(io);
+            bin.setPermissions(io, .fromMode(0o755)) catch {};
+        } else |_| {}
+    }
+}
 
+/// Extract zip into cwd and hoist a single common root directory (no staging tree).
 fn unzip(gpa: Allocator, io: Io, path: []const u8) !void {
     const cwd = Io.Dir.cwd();
-    try cwd.deleteTree(io, stage_dir);
-    try cwd.createDirPath(io, stage_dir);
-    defer cwd.deleteTree(io, stage_dir) catch {};
-
-    {
-        var f = try cwd.openFile(io, path, .{});
-        defer f.close(io);
-        var rbuf: [16 * 1024]u8 = undefined;
-        var fr = f.reader(io, &rbuf);
-        var stage = try cwd.openDir(io, stage_dir, .{});
-        defer stage.close(io);
-        try std.zip.extract(stage, &fr, .{});
-    }
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var stage = try cwd.openDir(io, stage_dir, .{ .iterate = true });
-    defer stage.close(io);
+    var diagnostics: std.zip.Diagnostics = .{ .allocator = arena };
 
-    var wrappers: std.ArrayList([]const u8) = .empty;
-    var it = stage.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind == .directory) try wrappers.append(arena, try arena.dupe(u8, entry.name));
+    {
+        var f = try cwd.openFile(io, path, .{});
+        defer f.close(io);
+        var rbuf: [64 * 1024]u8 = undefined;
+        var fr = f.reader(io, &rbuf);
+        try std.zip.extract(cwd, &fr, .{ .diagnostics = &diagnostics });
     }
 
-    for (wrappers.items) |wrapper_name| {
-        var wrapper = try stage.openDir(io, wrapper_name, .{ .iterate = true });
+    if (diagnostics.root_dir.len > 0) {
+        var wrapper = try cwd.openDir(io, diagnostics.root_dir, .{ .iterate = true });
         defer wrapper.close(io);
 
         var children: std.ArrayList([]const u8) = .empty;
@@ -394,17 +301,13 @@ fn unzip(gpa: Allocator, io: Io, path: []const u8) !void {
         while (try cit.next(io)) |child| try children.append(arena, try arena.dupe(u8, child.name));
 
         for (children.items) |name| {
-            cwd.deleteTree(io, name) catch {}; // overwrite semantics, like decompress()
+            cwd.deleteTree(io, name) catch {};
             try wrapper.rename(name, cwd, name, io);
         }
+        try cwd.deleteTree(io, diagnostics.root_dir);
     }
 
-    if (comptime builtin.os.tag != .windows and Io.File.Permissions.has_executable_bit) {
-        if (cwd.openFile(io, "appservices", .{})) |bin| {
-            defer bin.close(io);
-            bin.setPermissions(io, .fromMode(0o755)) catch {};
-        } else |_| {}
-    }
+    chmodAppservices(io);
 }
 
 fn decompressArchive(gpa: Allocator, io: Io, filepath: []const u8) ?Fail {
@@ -414,30 +317,44 @@ fn decompressArchive(gpa: Allocator, io: Io, filepath: []const u8) ?Fail {
     }
     if (std.mem.endsWith(u8, filepath, "tar.gz")) {
         untar(io, filepath) catch |e| return coerceInstall(e);
+        chmodAppservices(io);
         return null;
     }
     return Fail.initFmt(error.UnexpectedArchive, "could not decompress archive: unexpected archive type for file: {s}", .{filepath});
 }
 
-/// Runs the install pipeline. Returns a populated `Fail` on error, `null` on success.
 fn execute(gpa: Allocator, io: Io) ?Fail {
-    const manifest = switch (fetchManifest(gpa, io)) {
+    if (alreadyCurrent(gpa, io)) {
+        console.log(io, "appservices {s} already present, skipping download.", .{package_version});
+        return null;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const manifest = switch (fetchManifest(arena, io)) {
         .ok => |m| m,
         .err => |f| return f,
     };
-    defer gpa.free(manifest);
 
-    const url = switch (getDownloadURL(gpa, io, manifest)) {
+    const url_in_arena = switch (getDownloadURL(arena, manifest)) {
         .ok => |u| u,
         .err => |f| return f,
     };
+
+    const url = gpa.dupe(u8, url_in_arena) catch |e| return coerceInstall(e);
     defer gpa.free(url);
+    _ = arena_state.reset(.retain_capacity);
 
     const archive = switch (requestArchive(gpa, io, url)) {
         .ok => |a| a,
         .err => |f| return f,
     };
-    defer gpa.free(archive);
+    defer {
+        Io.Dir.cwd().deleteFile(io, archive) catch {};
+        gpa.free(archive);
+    }
 
     return decompressArchive(gpa, io, archive);
 }

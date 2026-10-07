@@ -1,19 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
-const prim = @import("primitives/root.zig");
 const console = @import("console.zig");
-
-fn onExit(io: Io, child: *std.process.Child) Io.Cancelable!u8 {
-    const term = child.wait(io) catch |e| switch (e) {
-        error.Canceled => return error.Canceled,
-        else => return 1,
-    };
-    return switch (term) {
-        .exited => |code| code,
-        else => 1, // killed by signal: node reports a null code, which is !== 0
-    };
-}
 
 pub fn run(init: std.process.Init, args: []const [:0]const u8) u8 {
     const io = init.io;
@@ -41,9 +29,12 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) u8 {
         return 1;
     };
 
-    var exited = prim.zig(io, onExit, .{ io, &child }) catch {
+    const term = child.wait(io) catch {
         child.kill(io);
         return 1;
     };
-    return exited.await(io) catch 1;
+    return switch (term) {
+        .exited => |code| code,
+        else => 1,
+    };
 }
