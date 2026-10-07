@@ -5,11 +5,10 @@
 //! progress, and a `WaitGroup` joins them.
 const std = @import("std");
 const builtin = @import("builtin");
+const prim = @import("primitives/root.zig");
+const console = @import("console.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const prim = @import("primitives/root.zig");
-
-const console = @import("console.zig");
 
 const KILOBYTE = 1024;
 const MAX_BYTES_READ = 800000;
@@ -27,7 +26,6 @@ const InstallError = error{
     Download,
 };
 
-/// Error set value plus an optional detail string (formatted into an inline buffer).
 fn Error(comptime T: type) type {
     return struct {
         @"error": T,
@@ -83,11 +81,11 @@ fn coerceInstall(e: anyerror) Fail {
     };
 }
 
-fn fetchManifest(gpa: Allocator, io: Io) Result([]u8) {
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+fn fetchManifest(allocator: Allocator, io: Io) Result([]u8) {
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
 
-    var body: Io.Writer.Allocating = .init(gpa);
+    var body: Io.Writer.Allocating = .init(allocator);
     defer body.deinit();
 
     const res = client.fetch(.{
@@ -132,7 +130,8 @@ fn objectField(v: std.json.Value, key: []const u8) ?std.json.Value {
 }
 
 fn urlFor(info: ?std.json.Value, tag: []const u8) InstallError![]const u8 {
-    const entry = objectField(info orelse return error.ManifestMalformed, tag) orelse return error.ManifestMalformed;
+    const v = info orelse return error.ManifestMalformed;
+    const entry = objectField(v, tag) orelse return error.ManifestMalformed;
     const url = objectField(entry, "url") orelse return error.ManifestMalformed;
     if (url != .string) return error.ManifestMalformed;
     return url.string;
@@ -157,34 +156,36 @@ fn tomlStringField(bytes: []const u8, key: []const u8) InstallError![]const u8 {
 
 /// Prefer package.toml next to this binary (npm keeps package.json next to install.js);
 /// fall back to cwd for `zig build postinstall` from the project root before install.
-fn readPackageToml(gpa: Allocator, io: Io) ![]u8 {
+fn readPackageToml(allocator: Allocator, io: Io) ![]u8 {
     var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     if (std.process.executableDirPath(io, &dir_buf)) |dir_len| {
-        const beside = try std.fs.path.join(gpa, &.{ dir_buf[0..dir_len], "package.toml" });
-        defer gpa.free(beside);
+        const toml_path = try std.fs.path.join(allocator, &.{ dir_buf[0..dir_len], "package.toml" });
+        defer allocator.free(toml_path);
         if (Io.Dir.cwd().readFileAlloc(
             io,
-            beside,
-            gpa,
+            toml_path,
+            allocator,
             .limited(1 << 20),
         )) |bytes| return bytes else |_| {}
     } else |_| {}
-    return Io.Dir.cwd().readFileAlloc(io, "package.toml", gpa, .limited(1 << 20));
+    return Io.Dir.cwd().readFileAlloc(io, "package.toml", allocator, .limited(1 << 20));
 }
 
-fn getDownloadURL(gpa: Allocator, io: Io, manifest_json: []const u8) Result([]u8) {
+fn getDownloadURL(allocator: Allocator, io: Io, manifest_json: []const u8) Result([]u8) {
     const tag = platformTag() catch |e| return .{ .err = Fail.init(e) };
 
-    var manifest = std.json.parseFromSlice(std.json.Value, gpa, manifest_json, .{}) catch |e| return .{ .err = coerceInstall(e) };
+    var manifest = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        manifest_json,
+        .{},
+    ) catch |e| return .{ .err = coerceInstall(e) };
     defer manifest.deinit();
 
-    // if (manifest.version !== packageMetadata.version) { look in past_releases }
-    // this was selected for package.json which we will turn into a toml file for this
-    // purpose.
-    const pkg_bytes = readPackageToml(gpa, io) catch |e| return .{ .err = coerceInstall(e) };
-    defer gpa.free(pkg_bytes);
-    const pkg_version = tomlStringField(pkg_bytes, "version") catch |e| return .{ .err = Fail.init(e) };
+    const pkg_bytes = readPackageToml(allocator, io) catch |e| return .{ .err = coerceInstall(e) };
+    defer allocator.free(pkg_bytes);
 
+    const pkg_version = tomlStringField(pkg_bytes, "version") catch |e| return .{ .err = Fail.init(e) };
     const manifest_version = objectField(manifest.value, "version") orelse return .{ .err = Fail.init(error.ManifestMalformed) };
     if (manifest_version != .string) return .{ .err = Fail.init(error.ManifestMalformed) };
 
@@ -194,14 +195,14 @@ fn getDownloadURL(gpa: Allocator, io: Io, manifest_json: []const u8) Result([]u8
                 const v = objectField(release, "version") orelse continue;
                 if (v == .string and std.mem.eql(u8, v.string, pkg_version)) {
                     const u = urlFor(objectField(release, "info"), tag) catch |e| return .{ .err = Fail.init(e) };
-                    const duped = gpa.dupe(u8, u) catch |e| return .{ .err = coerceInstall(e) };
+                    const duped = allocator.dupe(u8, u) catch |e| return .{ .err = coerceInstall(e) };
                     return .{ .ok = duped };
                 }
             };
         }
     }
     const u = urlFor(objectField(manifest.value, "info"), tag) catch |e| return .{ .err = Fail.init(e) };
-    const duped = gpa.dupe(u8, u) catch |e| return .{ .err = coerceInstall(e) };
+    const duped = allocator.dupe(u8, u) catch |e| return .{ .err = coerceInstall(e) };
     return .{ .ok = duped };
 }
 
@@ -213,6 +214,8 @@ const Chunk = struct {
 const Shared = struct {
     gpa: Allocator,
     url: []const u8,
+    // using this is just solving for a non-existing problem
+    // using a direct download is actually more efficient
     ch: prim.Channel(Chunk),
     failed: ?Fail = null,
 };
